@@ -1,0 +1,4 @@
+node_modules/
+updates/
+.export-tmp/
+.env

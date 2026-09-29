@@ -1,0 +1,21 @@
+services:
+  ota-server:
+    build: .
+    container_name: ota-server
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3001}:${PORT:-3001}"
+    environment:
+      - PORT=${PORT:-3001}
+      - PUBLISH_TOKEN=${PUBLISH_TOKEN:-baseapp-ota-secret-token-2026}
+    volumes:
+      # Mount updates folder to host to persist OTA releases across container restarts
+      - ./updates:/app/updates
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: ota-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://ota-server:3001
+    depends_on:
+      - ota-server
