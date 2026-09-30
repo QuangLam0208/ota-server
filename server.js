@@ -343,7 +343,8 @@ function createApp({
 
     let metadataJson
     try {
-      ;({ metadataJson } = await getMetadataAsync({ updateBundlePath, runtimeVersion }))
+      const result = await getMetadataAsync({ updateBundlePath, runtimeVersion })
+      metadataJson = result.metadataJson
     } catch (error) {
       res.status(404).json({ error: error.message })
       return
