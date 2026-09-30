@@ -2,3 +2,4 @@ node_modules/
 updates/
 .export-tmp/
 .env
+keys/private-key.pem

@@ -1,21 +1,26 @@
 services:
   ota-server:
     build: .
-    container_name: ota-server
-    restart: unless-stopped
     ports:
-      - "${PORT:-3001}:${PORT:-3001}"
-    environment:
-      - PORT=${PORT:-3001}
-      - PUBLISH_TOKEN=${PUBLISH_TOKEN:-baseapp-ota-secret-token-2026}
+      - "3001:3001"
+    env_file:
+      - .env
     volumes:
-      # Mount updates folder to host to persist OTA releases across container restarts
       - ./updates:/app/updates
-
-  cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: ota-tunnel
+      - ./keys:/app/keys:ro
     restart: unless-stopped
-    command: tunnel --no-autoupdate --url http://ota-server:3001
+
+  # Optional: Dùng khi muốn public qua ngrok ra ngoài Internet
+  # Để chạy kèm ngrok: docker compose --profile ngrok up -d
+  ngrok:
+    profiles: ["ngrok"]
+    image: ngrok/ngrok:latest
+    restart: unless-stopped
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
+    command: http ota-server:3001 --url=${NGROK_DOMAIN:-}
+    ports:
+      - "4040:4040"
     depends_on:
       - ota-server
+

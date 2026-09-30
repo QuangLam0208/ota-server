@@ -16,7 +16,9 @@ const {
   getMetadataAsync,
   listPublishedUpdates,
   publishExportedBundle,
+  republishUpdate,
   deleteUpdate,
+  signManifest,
 } = require("./helpers")
 
 function escapeHtml(value) {
@@ -52,7 +54,10 @@ function renderDashboardHtml(updates) {
       <td>${escapeHtml(u.timestamp)}</td>
       <td><code>${escapeHtml(u.id)}</code></td>
       <td>${escapeHtml(formatDateTime(u.createdAt))}</td>
-      <td>
+      <td style="display: flex; gap: 8px;">
+        <form method="POST" action="/updates/${encodeURIComponent(u.runtimeVersion)}/${encodeURIComponent(u.channel)}/${encodeURIComponent(u.timestamp)}/republish" onsubmit="return confirm('Re-publish bản ${escapeHtml(u.timestamp)} (${escapeHtml(formatDateTime(u.createdAt))}) làm bản mới nhất?')">
+          <button type="submit" class="republish">Re-publish</button>
+        </form>
         <form method="POST" action="/updates/${encodeURIComponent(u.runtimeVersion)}/${encodeURIComponent(u.channel)}/${encodeURIComponent(u.timestamp)}/delete" onsubmit="return confirm('Xóa bản update này?')">
           <button type="submit">Xóa</button>
         </form>
@@ -75,6 +80,8 @@ function renderDashboardHtml(updates) {
     code { font-size: 12px; }
     button { background: #c0392b; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; }
     button:hover { background: #e74c3c; }
+    button.republish { background: #27ae60; }
+    button.republish:hover { background: #2ecc71; }
   </style>
 </head>
 <body>
@@ -91,11 +98,20 @@ function renderDashboardHtml(updates) {
 </html>`
 }
 
-function sendMultipart(res, partName, payload) {
+// `payloadString` must be the *exact* string that was (or will be) signed —
+// never re-JSON.stringify a payload separately for signing vs. sending, or
+// the client's byte-for-byte signature verification will fail even though
+// the two strings look identical.
+function sendMultipart(res, partName, payloadString, signature = null) {
   const form = new FormData()
-  form.append(partName, JSON.stringify(payload), {
+  const partHeaders = { "content-type": "application/json; charset=utf-8" }
+  if (signature) {
+    partHeaders["expo-signature"] = signature
+  }
+
+  form.append(partName, payloadString, {
     contentType: "application/json",
-    header: { "content-type": "application/json; charset=utf-8" },
+    header: partHeaders,
   })
 
   res.status(200)
@@ -109,6 +125,8 @@ function sendMultipart(res, partName, payload) {
 function createApp({
   updatesRoot = path.join(__dirname, "updates"),
   publishToken = process.env.PUBLISH_TOKEN,
+  privateKeyPath = process.env.PRIVATE_KEY_PATH || path.join(__dirname, "keys", "private-key.pem"),
+  keyId = process.env.KEY_ID || "main",
 } = {}) {
   const app = express()
   app.set("trust proxy", true)
@@ -194,6 +212,21 @@ function createApp({
     res.redirect("/")
   })
 
+  app.post("/updates/:runtimeVersion/:channel/:timestamp/republish", (req, res) => {
+    const { runtimeVersion, channel, timestamp: sourceTimestamp } = req.params
+    try {
+      const result = republishUpdate(updatesRoot, runtimeVersion, channel, sourceTimestamp)
+      console.log(
+        `[OTA Rollback] Cloned ${runtimeVersion}/${channel}/${sourceTimestamp} -> ${result.newTimestamp}`,
+      )
+    } catch (error) {
+      console.error(`[OTA Rollback Error] ${error.message}`)
+      res.status(400).send(`Rollback failed: ${error.message}`)
+      return
+    }
+    res.redirect("/")
+  })
+
   app.get("/api/manifest", async (req, res) => {
     const platform = req.headers["expo-platform"]
     if (platform !== "ios" && platform !== "android") {
@@ -243,7 +276,12 @@ function createApp({
 
       if (currentUpdateId === manifestId) {
         console.log(`[Manifest Response] Matches currentUpdateId -> sending directive: noUpdateAvailable`)
-        sendMultipart(res, "directive", { type: "noUpdateAvailable" })
+        const directiveString = JSON.stringify({ type: "noUpdateAvailable" })
+        let directiveSignature = null
+        if (fs.existsSync(privateKeyPath)) {
+          directiveSignature = signManifest(directiveString, privateKeyPath, keyId)
+        }
+        sendMultipart(res, "directive", directiveString, directiveSignature)
         return
       }
 
@@ -288,10 +326,18 @@ function createApp({
           hostname,
         }),
         metadata: {},
-        extra: {},
+        extra: {
+          scopeKey: hostname,
+        },
       }
 
-      sendMultipart(res, "manifest", manifest)
+      const manifestString = JSON.stringify(manifest)
+      let signature = null
+      if (fs.existsSync(privateKeyPath)) {
+        signature = signManifest(manifestString, privateKeyPath, keyId)
+      }
+
+      sendMultipart(res, "manifest", manifestString, signature)
     } catch (error) {
       console.error(error)
       res.status(404).json({ error: String(error) })

@@ -1,5 +1,11 @@
 node_modules
 npm-debug.log
-updates
 .git
+.gitignore
 .env
+.env.example
+.superpowers
+test
+README.md
+updates
+*.log

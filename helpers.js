@@ -203,6 +203,57 @@ function publishExportedBundle({ exportedDir, runtimeVersion, channel, updatesRo
   return targetDir
 }
 
+// Clones an existing published update under a fresh timestamp — used to
+// roll back instantly without re-running `expo export` (see docs/ota_instant_republish_plan.md).
+function republishUpdate(updatesRoot, runtimeVersion, channel, sourceTimestamp) {
+  if (
+    !isSafePathSegment(runtimeVersion) ||
+    !isSafePathSegment(channel) ||
+    !isSafePathSegment(sourceTimestamp)
+  ) {
+    throw new Error("Invalid runtimeVersion, channel, or timestamp.")
+  }
+
+  const channelDir = path.join(updatesRoot, runtimeVersion, channel)
+  const sourceDir = path.join(channelDir, sourceTimestamp)
+
+  const resolvedUpdatesRoot = path.resolve(updatesRoot)
+  const resolvedSourceDir = path.resolve(sourceDir)
+  if (!resolvedSourceDir.startsWith(resolvedUpdatesRoot + path.sep)) {
+    throw new Error("Invalid runtimeVersion, channel, or timestamp.")
+  }
+
+  if (!fsSync.existsSync(sourceDir)) {
+    throw new Error(`No update found at ${runtimeVersion}/${channel}/${sourceTimestamp}`)
+  }
+
+  const newTimestamp = Date.now().toString()
+  const targetDir = path.join(channelDir, newTimestamp)
+
+  fsSync.mkdirSync(targetDir, { recursive: true })
+  fsSync.cpSync(sourceDir, targetDir, { recursive: true })
+
+  // expo-updates clients dedupe downloaded updates by manifest id (a hash of
+  // metadata.json) in their own local database. A byte-identical clone would
+  // reuse the source update's id, so a device that already ran the source
+  // once — the exact rollback scenario this function exists for — resolves
+  // back to its ORIGINAL stored record (original createdAt, original asset
+  // paths) instead of treating this republish as newer, and keeps running
+  // whatever buggy update it already has. Stamping a tiny marker into the
+  // cloned metadata.json changes its hash (and therefore its id) so the
+  // client sees a genuinely new update, while the bundle/asset files
+  // themselves stay byte-identical to the source (their own per-file hashes
+  // are unchanged, so the device's asset cache still avoids re-downloading
+  // them).
+  const metadataPath = path.join(targetDir, "metadata.json")
+  const metadataJson = JSON.parse(fsSync.readFileSync(metadataPath, "utf-8"))
+  metadataJson._republishedFrom = sourceTimestamp
+  metadataJson._republishedAt = newTimestamp
+  fsSync.writeFileSync(metadataPath, JSON.stringify(metadataJson))
+
+  return { runtimeVersion, channel, sourceTimestamp, newTimestamp, targetDir }
+}
+
 function deleteUpdate(updatesRoot, runtimeVersion, channel, timestamp) {
   if (
     !isSafePathSegment(runtimeVersion) ||
@@ -227,6 +278,28 @@ function deleteUpdate(updatesRoot, runtimeVersion, channel, timestamp) {
   fsSync.rmSync(targetDir, { recursive: true })
 }
 
+// Signs a manifest payload with the server's RSA private key — implements
+// the Expo Updates Protocol v1 code signing spec
+// (https://docs.expo.dev/technical-specs/expo-updates-1/#code-signing).
+// The client verifies this against its embedded certificate before ever
+// executing the downloaded bundle; a tampered-in-transit or rogue-server
+// payload fails verification and the client falls back to its last known
+// good update instead of running it.
+function signManifest(manifestPayloadString, privateKeyPemPath, keyId = process.env.KEY_ID || "main") {
+  if (!fsSync.existsSync(privateKeyPemPath)) {
+    throw new Error(`Private key not found at: ${privateKeyPemPath}`)
+  }
+
+  const privateKey = fsSync.readFileSync(privateKeyPemPath, "utf-8")
+  const sign = crypto.createSign("RSA-SHA256")
+  sign.update(manifestPayloadString)
+  sign.end()
+
+  const signatureBase64 = sign.sign(privateKey, "base64")
+
+  return `sig="${signatureBase64}", keyid="${keyId}", alg="rsa-v1_5-sha256"`
+}
+
 module.exports = {
   convertSHA256HashToUUID,
   isSafePathSegment,
@@ -235,5 +308,7 @@ module.exports = {
   getAssetMetadataAsync,
   listPublishedUpdates,
   publishExportedBundle,
+  republishUpdate,
   deleteUpdate,
+  signManifest,
 }

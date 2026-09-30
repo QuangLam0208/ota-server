@@ -367,3 +367,187 @@ test("POST /publish extracts a valid zip and makes it the latest update for that
     assert.equal(manifestRes.status, 200)
   })
 })
+
+const crypto = require("node:crypto")
+const { execSync } = require("node:child_process")
+
+const defaultOpensslConf = [
+  process.env.OPENSSL_CONF,
+  "C:\\Program Files\\Git\\usr\\ssl\\openssl.cnf",
+  "C:\\Program Files\\Git\\mingw64\\etc\\ssl\\openssl.cnf",
+  "C:\\msys64\\usr\\ssl\\openssl.cnf",
+].find((p) => p && fs.existsSync(p))
+
+function makeTestKeypair() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ota-keys-"))
+  const privateKeyPath = path.join(dir, "private-key.pem")
+  const certificatePath = path.join(dir, "certificate.pem")
+  const env = { ...process.env }
+  if (defaultOpensslConf && !env.OPENSSL_CONF) {
+    env.OPENSSL_CONF = defaultOpensslConf
+  }
+  execSync(`openssl genrsa -out "${privateKeyPath}" 2048`, { stdio: "pipe", env })
+  execSync(
+    `openssl req -new -x509 -key "${privateKeyPath}" -out "${certificatePath}" -days 1 -subj "/CN=test"`,
+    { stdio: "pipe", env },
+  )
+  return { privateKeyPath, certificatePath }
+}
+
+function extractPartWithRaw(rawBody, boundary, partName) {
+  const part = rawBody.split(`--${boundary}`).find((p) => p.includes(`name="${partName}"`))
+  if (!part) return null
+  const jsonStart = part.indexOf("{")
+  const jsonEnd = part.lastIndexOf("}")
+  const bodyString = part.slice(jsonStart, jsonEnd + 1)
+  return {
+    headersText: part.slice(0, jsonStart),
+    bodyString,
+    body: JSON.parse(bodyString),
+  }
+}
+
+function parseSigHeader(headersText) {
+  const match = headersText.match(/expo-signature: sig="([^"]+)"/)
+  return match ? match[1] : null
+}
+
+const { convertSHA256HashToUUID } = require("../helpers")
+
+test("POST .../republish clones the source update under a new timestamp and redirects to the dashboard", async () => {
+  const updatesRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ota-updates-"))
+  const bundleDir = path.join(updatesRoot, "2.2.2", "production", "1000")
+  fs.mkdirSync(bundleDir, { recursive: true })
+  const metadataText = JSON.stringify({ version: 0, bundler: "metro", fileMetadata: {} })
+  fs.writeFileSync(path.join(bundleDir, "metadata.json"), metadataText)
+
+  await withServer(updatesRoot, async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/updates/2.2.2/production/1000/republish`, {
+      method: "POST",
+      redirect: "manual",
+    })
+
+    assert.equal(res.status, 302)
+    assert.equal(res.headers.get("location"), "/")
+
+    const channelDir = path.join(updatesRoot, "2.2.2", "production")
+    const timestampDirs = fs.readdirSync(channelDir)
+    assert.equal(timestampDirs.length, 2)
+
+    const newTimestamp = timestampDirs.find((t) => t !== "1000")
+    assert.ok(Number(newTimestamp) > 1000)
+    assert.ok(
+      fs.existsSync(path.join(channelDir, newTimestamp, "metadata.json")),
+      "cloned update must contain the source's metadata.json",
+    )
+  })
+})
+
+test("POST .../republish returns 400 for a non-existent source timestamp", async () => {
+  const updatesRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ota-updates-"))
+  await withServer(updatesRoot, async (baseUrl) => {
+    const res = await fetch(`${baseUrl}/updates/2.2.2/production/9999/republish`, {
+      method: "POST",
+    })
+
+    assert.equal(res.status, 400)
+    assert.match(await res.text(), /Rollback failed/)
+  })
+})
+
+test("POST .../republish rejects a path-traversal channel", async () => {
+  const updatesRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ota-updates-"))
+  const bundleDir = path.join(updatesRoot, "2.2.2", "production", "1000")
+  fs.mkdirSync(bundleDir, { recursive: true })
+  fs.writeFileSync(path.join(bundleDir, "metadata.json"), JSON.stringify({ version: 0, bundler: "metro", fileMetadata: {} }))
+
+  await withServer(updatesRoot, async (baseUrl) => {
+    const res = await fetch(
+      `${baseUrl}/updates/2.2.2/${encodeURIComponent("../../etc")}/1000/republish`,
+      { method: "POST" },
+    )
+
+    assert.equal(res.status, 400)
+    assert.match(await res.text(), /Rollback failed/)
+  })
+})
+
+test("GET /api/manifest signs the noUpdateAvailable directive when a private key is configured", async () => {
+  const updatesRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ota-updates-"))
+  const bundleDir = path.join(updatesRoot, "2.2.2", "production", "1000")
+  fs.mkdirSync(bundleDir, { recursive: true })
+  const metadataText = JSON.stringify({ version: 0, bundler: "metro", fileMetadata: {} })
+  fs.writeFileSync(path.join(bundleDir, "metadata.json"), metadataText)
+  const manifestId = convertSHA256HashToUUID(
+    crypto.createHash("sha256").update(metadataText).digest("hex"),
+  )
+  const { privateKeyPath, certificatePath } = makeTestKeypair()
+
+  const app = createApp({ updatesRoot, privateKeyPath })
+  const server = app.listen(0)
+  const { port } = server.address()
+  try {
+    const res = await fetch(`http://localhost:${port}/api/manifest`, {
+      headers: {
+        "expo-platform": "android",
+        "expo-runtime-version": "2.2.2",
+        "expo-channel-name": "production",
+        "expo-current-update-id": manifestId,
+      },
+    })
+
+    const rawBody = await res.text()
+    const boundary = getBoundary(res.headers.get("content-type"))
+    const { headersText, body, bodyString } = extractPartWithRaw(rawBody, boundary, "directive")
+
+    assert.equal(body.type, "noUpdateAvailable")
+    const signatureBase64 = parseSigHeader(headersText)
+    assert.ok(signatureBase64, "expo-signature header must be present on the signed part")
+
+    const certificate = fs.readFileSync(certificatePath, "utf-8")
+    const verify = crypto.createVerify("RSA-SHA256")
+    verify.update(bodyString)
+    verify.end()
+    assert.equal(
+      verify.verify(certificate, signatureBase64, "base64"),
+      true,
+      "signature must verify against the exact bytes sent as the part body",
+    )
+  } finally {
+    server.close()
+  }
+})
+
+test("GET /api/manifest omits expo-signature when no private key is configured (unsigned mode)", async () => {
+  const updatesRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ota-updates-"))
+  const bundleDir = path.join(updatesRoot, "2.2.2", "production", "1000")
+  fs.mkdirSync(bundleDir, { recursive: true })
+  const metadataText = JSON.stringify({ version: 0, bundler: "metro", fileMetadata: {} })
+  fs.writeFileSync(path.join(bundleDir, "metadata.json"), metadataText)
+  const manifestId = convertSHA256HashToUUID(
+    crypto.createHash("sha256").update(metadataText).digest("hex"),
+  )
+
+  const app = createApp({ updatesRoot, privateKeyPath: "/nonexistent/private-key.pem" })
+  const server = app.listen(0)
+  const { port } = server.address()
+  try {
+    const res = await fetch(`http://localhost:${port}/api/manifest`, {
+      headers: {
+        "expo-platform": "android",
+        "expo-runtime-version": "2.2.2",
+        "expo-channel-name": "production",
+        "expo-current-update-id": manifestId,
+      },
+    })
+
+    const rawBody = await res.text()
+    const boundary = getBoundary(res.headers.get("content-type"))
+    const { headersText } = extractPartWithRaw(rawBody, boundary, "directive")
+
+    assert.equal(parseSigHeader(headersText), null)
+  } finally {
+    server.close()
+  }
+})
+
