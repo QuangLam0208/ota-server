@@ -326,9 +326,7 @@ function createApp({
           hostname,
         }),
         metadata: {},
-        extra: {
-          scopeKey: hostname,
-        },
+        extra: {},
       }
 
       const manifestString = JSON.stringify(manifest)
